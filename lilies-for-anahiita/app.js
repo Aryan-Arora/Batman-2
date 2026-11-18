@@ -9,7 +9,8 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 const $ = (s) => document.querySelector(s);
 const MOBILE = matchMedia('(pointer: coarse)').matches || Math.min(innerWidth, innerHeight) < 600;
-const Q = MOBILE ? { grass: 7000, petalU: 26, petalV: 10, name: 5200, dpr: 1.5 } : { grass: 16000, petalU: 36, petalV: 14, name: 11000, dpr: 2 };
+const Q = MOBILE ? { grass: 7000, petalU: 34, petalV: 12, budU: 14, name: 5200, dpr: 1.5, dofSamples: 26 } : { grass: 16000, petalU: 52, petalV: 18, budU: 20, name: 11000, dpr: 1.75, dofSamples: 44 };
+const FIXED_RES = new URLSearchParams(location.search).has('fixed');
 
 // ---------------------------------------------------------------- renderer
 const canvas = $('#gl');
@@ -20,9 +21,10 @@ try {
 renderer.setPixelRatio(Math.min(devicePixelRatio, Q.dpr));
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
+renderer.toneMappingExposure = 0.98;
 
 const scene = new THREE.Scene();
+const overlay = new THREE.Scene(); // drawn after depth of field, always crisp
 const camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.05, 200);
 
 const rand = (() => { let s = 20250214; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); })();
@@ -77,17 +79,25 @@ vec3 stemTangent(float h, float grow, vec3 wo){
   float H = stemH(grow);
   return normalize(vec3(0.,H,0.) + 2.*h*(leanVec(H) + wo*H));
 }
+mat3 basisFrom(vec3 axis){
+  vec3 ref = abs(axis.y) < .95 ? vec3(0.,1.,0.) : vec3(1.,0.,0.);
+  vec3 X = normalize(cross(ref, axis));
+  return mat3(X, axis, cross(X, axis));
+}
+// a side bud on a short pedicel; shared by the bud tepals and their pedicel
+vec3 budHead(vec4 bd, float grow, vec3 wo){
+  vec3 sp = stemPoint(bd.z, grow, wo);
+  vec3 ow = vec3(cos(bd.y), 0., sin(bd.y));
+  return sp + (ow*.075 + vec3(0., .035, 0.))*bd.w*mix(.3, 1., grow) + wo*.4*bd.w;
+}
 void flowerFrame(out vec3 head, out mat3 B, out float grow, out float bloom, out float fs){
   grow = growOf(); bloom = bloomOf(); vec3 wo = windOff();
   head = stemPoint(1., grow, wo);
   vec3 tng = stemTangent(1., grow, wo);
   vec3 outw = normalize(vec3(cos(aF1.z),0.,sin(aF1.z))*.95 + vec3(0.,.62,0.));
   vec3 axis = normalize(mix(tng, outw, .12 + .62*bloom) + wo*.6);
-  vec3 ref = abs(axis.y) < .95 ? vec3(0.,1.,0.) : vec3(1.,0.,0.);
-  vec3 X = normalize(cross(ref, axis));
-  vec3 Z = cross(X, axis);
-  B = mat3(X, axis, Z);
-  fs = (.86 + .3*fract(aF0.w*7.13)) * mix(.22, 1., grow);
+  B = basisFrom(axis);
+  fs =(.86 + .3*fract(aF0.w*7.13)) * mix(.22, 1., grow);
 }
 mat3 rotY(float a){ float c=cos(a), s=sin(a); return mat3(c,0.,-s, 0.,1.,0., s,0.,c); }
 vec2 arcC(float s, float L, float t0, float t1){
@@ -130,6 +140,35 @@ vec3 shade(vec3 base, vec3 N, vec3 V, vec3 W, float trans, float spec){
   col += pow(max(dot(N, h), 0.), 46.) * spec * keyC * .35;
   return col;
 }
+// derivative bump mapping (Mikkelsen) — height h in world units
+vec3 bumpN(vec3 P, vec3 N, float h){
+  vec3 dpx = dFdx(P), dpy = dFdy(P);
+  float dhx = dFdx(h), dhy = dFdy(h);
+  vec3 r1 = cross(dpy, N), r2 = cross(N, dpx);
+  float det = dot(dpx, r1);
+  vec3 g = sign(det)*(dhx*r1 + dhy*r2);
+  return normalize(abs(det)*N - g);
+}
+// thin, waxy tepal: wrapped diffuse, light filtering through the pigment, satin highlights, velvet sheen
+vec3 petalLight(vec3 base, vec3 N, vec3 V, vec3 W, float thin, float ao){
+  vec3 Ck = S(vec3(1., .9, .83))*.9;
+  vec3 Cm = S(vec3(.6, .7, 1.))*1.45;
+  float nk = dot(N, uKeyDir), nm = dot(N, uMoonDir), nv = max(dot(N, V), 0.);
+  float dk = max((nk + .3)/1.3, 0.), dm = max((nm + .3)/1.3, 0.);
+  vec3 amb = mix(S(vec3(.04,.045,.05)), S(vec3(.19,.18,.33)), N.y*.5 + .5);
+  vec3 col = base*(amb*ao + Ck*dk*.72*ao + Cm*dm*.32*mix(.6, 1., ao));
+  vec3 transC = base*base*1.25 + base*.12;
+  float fwd = pow(max(dot(V, -uMoonDir), 0.), 4.);
+  col += transC*(Ck*max(-nk, 0.)*.4 + Cm*(max(-nm, 0.)*.55 + fwd*.8))*thin;
+  vec3 H = normalize(uKeyDir + V); float nh = max(dot(N, H), 0.);
+  float fr = .04 + .96*pow(1. - nv, 5.);
+  col += Ck*(pow(nh, 70.)*.45 + pow(nh, 14.)*.05)*(.35 + fr)*max(nk, 0.)*ao;
+  vec3 Hm = normalize(uMoonDir + V);
+  col += Cm*pow(max(dot(N, Hm), 0.), 40.)*.22*max(nm, 0.);
+  col += pow(1. - nv, 2.6)*base*S(vec3(.88, .84, 1.))*.16*(dk + .25);
+  col += glowAt(W, N)*base*.35;
+  return col;
+}
 vec3 fogIt(vec3 col, vec3 W){
   float d = length(W - uCamPos);
   float f = 1. - exp(-pow(d*uFogDensity, 1.5));
@@ -142,76 +181,94 @@ const MAXF = 64;
 const flowers = []; // CPU mirror
 let flowerCursor = 0;
 
-function makeInstanced(baseGeo, perFlower, extraName, extraFill, material) {
+function makeInstanced(baseGeo, perFlower, extras, material) {
   const geo = new THREE.InstancedBufferGeometry();
   geo.index = baseGeo.index;
   for (const k in baseGeo.attributes) geo.setAttribute(k, baseGeo.attributes[k]);
   const n = MAXF * perFlower;
-  const f0 = new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4);
-  const f1 = new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4);
-  const ex = new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4);
+  const attrs = {};
+  for (const name of ['aF0', 'aF1', ...Object.keys(extras)]) {
+    attrs[name] = new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4);
+    geo.setAttribute(name, attrs[name]);
+  }
   // park unused instances far in the future (invisible / tiny)
-  for (let i = 0; i < n; i++) { f1.array[i * 4] = 1e6; }
-  geo.setAttribute('aF0', f0); geo.setAttribute('aF1', f1); geo.setAttribute(extraName, ex);
+  for (let i = 0; i < n; i++) attrs.aF1.array[i * 4] = 1e6;
   geo.instanceCount = 0;
   const mesh = new THREE.Mesh(geo, material);
   mesh.frustumCulled = false;
   scene.add(mesh);
-  return { mesh, geo, f0, f1, ex, perFlower, extraFill };
+  return { mesh, geo, attrs, perFlower, extras };
 }
 
 // petal geometry: x = u (0..1 along), y = v (-1..1 across)
 const petalBase = new THREE.PlaneGeometry(1, 2, Q.petalU, Q.petalV); petalBase.translate(0.5, 0, 0);
-const tubeBase = new THREE.CylinderGeometry(1, 1, 1, 7, 14, true);
-const sphereBase = new THREE.SphereGeometry(1, 14, 10);
-const leafBase = new THREE.PlaneGeometry(1, 2, 14, 2); leafBase.translate(0.5, 0, 0);
-const stemBase = new THREE.CylinderGeometry(1, 1, 1, 7, 22, true);
+const budBase = new THREE.PlaneGeometry(1, 2, Q.budU, 6); budBase.translate(0.5, 0, 0);
+const tubeBase = new THREE.CylinderGeometry(1, 1, 1, 8, 16, true);
+const sphereBase = new THREE.SphereGeometry(1, 18, 12);
+const leafBase = new THREE.PlaneGeometry(1, 2, 18, 4); leafBase.translate(0.5, 0, 0);
+const stemBase = new THREE.CylinderGeometry(1, 1, 1, 9, 24, true);
 
 // ---- petal material
 const petalMat = new THREE.ShaderMaterial({
   uniforms: U, side: THREE.DoubleSide,
   vertexShader: GL_COMMON + GL_FLOWER + /* glsl */`
-attribute vec4 aP; // azimuth, inner, seed, _
+attribute vec4 aP;   // azimuth, inner, seed, _
+attribute vec4 aBud; // isBud, bud azimuth, bud height on stem, bud scale
 varying vec2 vUV; varying vec3 vN; varying vec3 vW; varying float vB; varying float vInner; varying float vSeed; varying float vPal;
 vec3 petalLocal(float u, float v, float b, float inner, float ps, out vec2 nIn){
-  float L = mix(.4, .37, inner) * mix(.6, 1., b) * (1. + (ps-.5)*.08);
-  float W = mix(.068, .092, inner) * mix(.44, 1., b);
-  float a0c = mix(.6, .56, inner), a1c = -1.2;
-  float a0o = mix(.42, .34, inner), a1o = mix(1.95, 1.72, inner) + (ps-.5)*.25;
+  float r1 = fract(ps*13.71), r2 = fract(ps*71.33), r3 = fract(ps*157.9), r4 = fract(ps*311.7);
+  float L = mix(.415, .39, inner) * mix(.6, 1., b) * (.93 + .14*r1);
+  float W = mix(.056, .1, inner) * mix(.42, 1., b) * (.9 + .2*r2);
+  float a0c = mix(.6, .54, inner), a1c = -1.2;
+  float a0o = mix(.36, .29, inner) + (r4 - .5)*.08;
+  float a1o = mix(2.1, 1.82, inner) + (r3 - .5)*.5;
   vec2 c = vec2(0.);
   float ds = u/14.;
   for(int i=0;i<14;i++){
-    float s = (float(i)+.5)*ds;
-    float th = mix(a0c + a1c*s, a0o + a1o*pow(s, 1.55), b);
+    float s = (float(i) + .5)*ds;
+    float th = mix(a0c + a1c*s, a0o + a1o*pow(s, 1.7), b);
     c += vec2(sin(th), cos(th))*ds;
   }
   c *= L;
-  float th = mix(a0c + a1c*u, a0o + a1o*pow(u, 1.55), b);
+  float th = mix(a0c + a1c*u, a0o + a1o*pow(u, 1.7), b);
   vec2 d = vec2(sin(th), cos(th));
   nIn = vec2(-d.y, d.x);
-  float w = W * pow(max(sin(PI*pow(clamp(u,0.,1.), .62)), 0.), .82);
-  float x = v*w;
-  float cupO = mix(6.5, -2.6, smoothstep(.3, .95, u));
-  float cup = mix(15., cupO, b);
-  float ruffle = sin(u*31. + ps*20. + v*2.)*.011*pow(abs(v), 3.)*b*(.35 + .65*inner)*smoothstep(.2,.6,u);
-  float groove = -.006*b*exp(-v*v*26.)*sin(PI*u);
-  float twist = (ps-.5)*.5*b*u*u;
-  vec2 xy = c + nIn*(cup*x*x + ruffle + groove);
-  vec3 p = vec3(xy, x);
-  p.xz = mat2(cos(twist), sin(twist), -sin(twist), cos(twist))*p.xz;
-  p.x *= mix(1., .84, inner*(1.-b));
+  float uc = clamp(u, 0., 1.);
+  // outer tepals lanceolate & pointed, inner ones broad and ovate; both narrow to a claw at the base
+  float prof = mix(pow(max(sin(PI*pow(uc, .64)), 0.), .92), pow(max(sin(PI*pow(uc, .8)), 0.), .68), inner);
+  prof *= mix(.5, 1., smoothstep(0., .22, uc));
+  float w = W*prof;
+  float x = v*w, av = abs(v);
+  float cup = mix(15., mix(5.5, -3.4, smoothstep(.25, .95, u)), b);           // trumpet at the base, margins rolling back
+  float vfold = b*.2*(1. - smoothstep(.45, 1., u));                            // V-fold along the midrib
+  float furrow = -.011*b*exp(-v*v*30.)*(1. - smoothstep(.05, .62, u))*smoothstep(0., .06, u); // nectary furrow
+  float waveA = mix(.0035, .013, inner)*b*smoothstep(.15, .55, u)*(1. - smoothstep(.9, 1., u));
+  float wave = (sin(u*mix(20., 27., r1) + ps*30. + v*1.5) + .35*sin(u*47. + ps*11.)*av)*pow(av, 2.5)*waveA;
+  float off = cup*x*x + vfold*abs(x) + furrow + wave;
+  float tw = (r2 - .5)*.6*b*u*u;                                               // each tepal twists a little
+  vec2 xy = c + nIn*(off + x*sin(tw));
+  vec3 p = vec3(xy, x*cos(tw) + (r4 - .5)*.05*b*u*u);
+  p.x *= mix(1., .84, inner*(1. - b));
   return p;
 }
 void main(){
   vec3 head; mat3 B; float grow, bloom, fs;
   flowerFrame(head, B, grow, bloom, fs);
-  float inner = aP.y;
-  float b = clamp((bloom - (1.-inner)*0. - inner*.14)/.86, 0., 1.);
-  b = b*b*(3.-2.*b);
+  float inner = aP.y, b;
+  if(aBud.x > .5){
+    vec3 wo = windOff();
+    head = budHead(aBud, grow, wo);
+    B = basisFrom(normalize(vec3(cos(aBud.y), 0., sin(aBud.y))*.5 + vec3(0., 1., 0.) + wo*.8));
+    fs = aBud.w*mix(.25, 1., grow);
+    b = .035*bloom;
+  } else {
+    b = clamp((bloom - inner*.14)/.86, 0., 1.);
+    b = b*b*(3. - 2.*b);
+  }
   float u = position.x, v = position.y;
   vec2 nIn, dmy;
   vec3 p0 = petalLocal(u, v, b, inner, aP.z, nIn);
-  float un = clamp(u, .015, .985), e = .006;
+  float un = clamp(u, .015, .985), e = .005;
   vec3 q0 = petalLocal(un, v, b, inner, aP.z, dmy);
   vec3 pu = petalLocal(un + e, v, b, inner, aP.z, dmy);
   vec3 pv = petalLocal(un, v + e, b, inner, aP.z, dmy);
@@ -227,71 +284,79 @@ void main(){
   fragmentShader: GL_COMMON + GL_LIGHT + /* glsl */`
 varying vec2 vUV; varying vec3 vN; varying vec3 vW; varying float vB; varying float vInner; varying float vSeed; varying float vPal;
 void main(){
-  float u = vUV.x, v = vUV.y, av = abs(v);
-  vec3 edgeC, midC, spotC, throatC; float spots, centerAmt;
-  if(vPal < .5){        // stargazer
-    edgeC = vec3(1., .93, .96); midC = vec3(.86, .16, .45); spotC = vec3(.42, .02, .12); throatC = vec3(.86,.9,.55); spots = 1.; centerAmt = 1.;
-  } else if(vPal < 1.5){ // casablanca white
-    edgeC = vec3(1., .985, .97); midC = vec3(.99, .96, .9); spotC = vec3(.95, .82, .62); throatC = vec3(.78,.88,.5); spots = .12; centerAmt = .6;
+  float u = vUV.x, v = vUV.y, av = abs(v), sd = vSeed;
+  vec3 edgeC, flushC, deepC, spotC, throatC; float spots, flushAmt;
+  if(vPal < .5){         // 'Stargazer'
+    edgeC = vec3(1., .95, .965); flushC = vec3(.95, .38, .6); deepC = vec3(.74, .07, .3); spotC = vec3(.4, .01, .11); throatC = vec3(.74, .86, .38); spots = 1.; flushAmt = 1.;
+  } else if(vPal < 1.5){ // 'Casa Blanca'
+    edgeC = vec3(1., .992, .978); flushC = vec3(1., .982, .95); deepC = vec3(.99, .955, .88); spotC = vec3(.985, .95, .9); throatC = vec3(.6, .8, .34); spots = 1.; flushAmt = .7;
   } else if(vPal < 2.5){ // apricot
-    edgeC = vec3(1., .86, .72); midC = vec3(.98, .52, .34); spotC = vec3(.45, .1, .05); throatC = vec3(.98,.8,.45); spots = .75; centerAmt = .9;
+    edgeC = vec3(1., .84, .64); flushC = vec3(.99, .62, .38); deepC = vec3(.93, .38, .2); spotC = vec3(.4, .07, .04); throatC = vec3(.93, .78, .34); spots = .85; flushAmt = 1.;
   } else {               // blush
-    edgeC = vec3(1., .95, .97); midC = vec3(.97, .58, .72); spotC = vec3(.66, .12, .32); throatC = vec3(.88,.92,.6); spots = .6; centerAmt = .85;
+    edgeC = vec3(1., .965, .975); flushC = vec3(.98, .72, .82); deepC = vec3(.92, .46, .64); spotC = vec3(.6, .1, .3); throatC = vec3(.76, .88, .48); spots = .55; flushAmt = 1.;
   }
-  float cm = (1. - smoothstep(.12, .9, av + u*.25)) * (1. - smoothstep(.4, .97, u));
-  cm = pow(cm, .7) * centerAmt;
-  vec3 base = mix(edgeC, midC, cm);
-  // pale halo along the margins
-  base = mix(base, edgeC, smoothstep(.72, 1., av)*.6);
-  // veins running along the tepal
-  float vein = .5 + .5*cos(v*44. + sin(u*9. + vSeed*7.)*1.4);
-  base *= 1. - .07*vein*(1. - u*.6)*cm;
-  // nectary groove & throat
-  float throat = (1. - smoothstep(0., .32, u)) * (1. - smoothstep(.05, .4, av));
-  float rib = (1. - smoothstep(0., .07, av)) * (1. - smoothstep(.2, .75, u));
-  base = mix(base, throatC, clamp(throat*.9 + rib*.5, 0., 1.));
-  // freckles (worley)
-  vec2 sp = vec2(u*17., v*5.2) + vSeed*13.1;
-  vec2 ip = floor(sp), fp = fract(sp); float md = 9.;
+  // fine parallel venation converging toward the tip
+  float warp = (vnoise(vec2(u*5., v*2.5) + sd*7.) - .5)*.7;
+  float vc = v*mix(10., 4.5, u*u) + warp;
+  float vein = pow(1. - abs(fract(vc) - .5)*2., 12.);
+  float veins = clamp(vein + pow(1. - abs(fract(vc*2.6 + .37) - .5)*2., 18.)*.35, 0., 1.)
+              * smoothstep(.04, .3, u)*(1. - smoothstep(.72, .96, u))*(.35 + .65*vnoise(vec2(u*9., v*20.) + sd*3.));
+  // pigment flush, its border feathering along the veins
+  float n1 = vnoise(vec2(u*11., v*7.) + sd*5.);
+  float feather = (vein - .4)*.1 + (n1 - .5)*.2;
+  float flush = (1. - smoothstep(.36, .8, av + feather + u*u*.3))*(1. - smoothstep(.7, .98, u + feather*.4))*flushAmt;
+  float deep = (1. - smoothstep(0., .45, av + feather*.6))*smoothstep(.1, .32, u)*(1. - smoothstep(.42, .78, u));
+  vec3 base = mix(edgeC, flushC, flush);
+  base = mix(base, deepC, deep*flush*.8);
+  base = mix(base, edgeC, smoothstep(.82, 1., av)*.75);
+  float throat = 1. - smoothstep(0., .27, u + av*.22);
+  float furrow = exp(-v*v*110.)*(1. - smoothstep(.08, .55, u));
+  base = mix(base, throatC, clamp(throat*.95 + furrow*.8, 0., 1.));
+  base = mix(base, base*vec3(.95, .985, .95), veins*(.5 + flush*.5));
+  // papillae: raised spots in the throat
+  vec2 sp = vec2(u*21., v*6.2) + sd*17.;
+  vec2 ip = floor(sp), fp = fract(sp); float md = 9., dome = 0.;
   for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++){
-    vec2 o = vec2(i,j); vec2 h = hash22(ip+o);
-    vec2 dd = o + h - fp; float sz = mix(.1, .3, hash12(ip+o+7.));
-    md = min(md, length(dd*vec2(1., 1.35)) - sz);
+    vec2 o = vec2(i, j); vec2 h = hash22(ip + o)*.8 + .1;
+    float sz = mix(.06, .27, hash12(ip + o + 7.));
+    float dist = length((o + h - fp)*vec2(1., 1.3));
+    md = min(md, dist - sz); dome = max(dome, 1. - smoothstep(0., sz, dist));
   }
-  float spot = 1. - smoothstep(-.03, .02, md);
-  spot *= smoothstep(.05, .13, u) * (1. - smoothstep(.32, .6, u)) * (1. - smoothstep(.42, .72, av)) * spots;
-  base = mix(base, spotC, spot*.92);
+  float region = smoothstep(.04, .11, u)*(1. - smoothstep(.3, .6, u + n1*.12))*(1. - smoothstep(.35, .74, av));
+  float spot = (1. - smoothstep(-.02, .015, md))*region;
+  dome *= region;
+  float fringe = step(.6, hash12(floor(vec2(u*170., v*46.))))*exp(-v*v*35.)*(1. - smoothstep(.04, .26, u));
 
-  vec3 N = normalize(vN);
-  vec3 V = normalize(uCamPos - vW);
-  bool innerSide = dot(N, V) > 0.;
-  if(!innerSide){ N = -N; base = mix(base, vec3(.93,.96,.86)*mix(edgeC, vec3(1.), .5), .5); base = mix(base, vec3(.72,.85,.48), rib*.6); }
-  // bud colour: green at the base, blushing toward the tip
-  vec3 bud = mix(vec3(.38,.56,.26), mix(edgeC, midC, .35)*.92, smoothstep(.25, 1., u));
-  base = mix(bud, base, smoothstep(.12, .8, vB));
+  vec3 N = normalize(vN); vec3 V = normalize(uCamPos - vW);
+  bool front = dot(N, V) > 0.;
+  float h;
+  if(front){
+    base = mix(base, spotC, spot*spots*.95);
+    base = mix(base, edgeC, fringe*.5);
+    h = dome*.0011*spots + veins*.00006 + fringe*.0003;
+  } else {
+    N = -N;
+    base = mix(base, edgeC, .45);
+    base = mix(base, vec3(.66, .8, .44), clamp((furrow*2. + throat)*.35 + exp(-v*v*60.)*.25*(1. - u), 0., 1.));
+    h = -veins*.00006;
+  }
+  N = bumpN(vW, N, h);
+  base = mix(base, vec3(.56, .72, .36), smoothstep(.94, 1., u)*(1. - vInner)*.55);     // green beak on outer tepals
+  vec3 bud = mix(vec3(.36, .55, .24), mix(edgeC, flushC, .45)*.95, smoothstep(.3, 1., u));
+  bud *= 1. - veins*.06;
+  base = mix(bud, base, smoothstep(.1, .75, vB));
   base = S(base);
-  vec3 col = shade(base, N, V, vW, .85, .7);
-  // soft inner luminescence – the lilies glow a little in the dark
-  col += base * S(vec3(1., .8, .88)) * (.015 + .06*(1.-smoothstep(0., .5, u))) * vB;
-  // papillae glitter
-  vec2 g = floor(vec2(u*90., v*24.));
-  float gl = step(.985, hash12(g + floor(vSeed*50.))) * (.5+.5*sin(uTime*3. + hash12(g)*40.));
-  col += gl * S(vec3(1., .9, .95)) * .9 * (1. - smoothstep(.2, .7, u)) * vB * (innerSide ? 1. : 0.);
-  col = fogIt(col, vW);
-  gl_FragColor = vec4(col, 1.);
+  float ao = front ? mix(.22, 1., smoothstep(0., .42, u)) : mix(.5, 1., smoothstep(0., .25, u));
+  float thin = mix(.3, 1., smoothstep(0., .55, u))*(1. - .5*exp(-v*v*22.))*(1. - veins*.22);
+  vec3 col = petalLight(base, N, V, vW, thin, ao);
+  vec2 g = floor(vec2(u*110., v*28.));
+  float gl = step(.988, hash12(g + floor(sd*50.)))*(.5 + .5*sin(uTime*2.5 + hash12(g)*40.));
+  col += gl*S(vec3(1., .92, .96))*.35*(1. - smoothstep(.25, .8, u))*vB*(front ? 1. : 0.)*max(dot(N, uKeyDir), 0.);
+  gl_FragColor = vec4(fogIt(col, vW), 1.);
 }`
 });
 
 // ---- stems
-const greenFrag = /* glsl */`
-varying vec3 vN; varying vec3 vW; varying float vT;
-void main(){
-  vec3 N = normalize(vN); vec3 V = normalize(uCamPos - vW);
-  if(dot(N, V) < 0.) N = -N;
-  vec3 base = S(mix(vec3(.1,.2,.09), vec3(.33,.52,.22), vT));
-  vec3 col = shade(base, N, V, vW, .6, .25);
-  gl_FragColor = vec4(fogIt(col, vW), 1.);
-}`;
 const stemMat = new THREE.ShaderMaterial({
   uniforms: U,
   vertexShader: GL_COMMON + GL_FLOWER + /* glsl */`
@@ -305,11 +370,21 @@ void main(){
   vec3 X = normalize(cross(T, vec3(0.,0.,1.))); vec3 Z = cross(X, T);
   float a = atan(position.z, position.x);
   vec3 nr = X*cos(a) + Z*sin(a);
-  float r = .0105*(1. - .35*h)*mix(.45, 1., grow)*(.9 + .2*fract(aF0.w*3.3));
-  vW = c + nr*r; vN = nr; vT = .3 + .7*h;
+  float r = .0125*(1. - .3*h)*mix(.45, 1., grow)*(.9 + .2*fract(aF0.w*3.3));
+  vW = c + nr*r; vN = nr; vT = h;
   gl_Position = projectionMatrix * viewMatrix * vec4(vW, 1.);
 }`,
-  fragmentShader: GL_COMMON + GL_LIGHT + greenFrag,
+  fragmentShader: GL_COMMON + GL_LIGHT + /* glsl */`
+varying vec3 vN; varying vec3 vW; varying float vT;
+void main(){
+  vec3 N = normalize(vN); vec3 V = normalize(uCamPos - vW);
+  vec3 base = mix(vec3(.12,.24,.1), vec3(.3,.48,.2), smoothstep(0., 1., vT));
+  float fleck = step(.86, vnoise(vec2(vW.y*420., atan(N.z, N.x)*9.)))*(1. - smoothstep(.0, .5, vT));
+  base = mix(base, vec3(.3,.12,.18), fleck*.7);                     // purple flecks low on the stem
+  base *= .92 + .08*sin(atan(N.z, N.x)*18.);                         // faint longitudinal ribs
+  vec3 col = shade(S(base), N, V, vW, .45, 1.2);
+  gl_FragColor = vec4(fogIt(col, vW), 1.);
+}`,
 });
 
 // ---- leaves
@@ -317,7 +392,7 @@ const leafMat = new THREE.ShaderMaterial({
   uniforms: U, side: THREE.DoubleSide,
   vertexShader: GL_COMMON + GL_FLOWER + /* glsl */`
 attribute vec4 aL; // h, azimuth, length, seed
-varying vec3 vN; varying vec3 vW; varying float vT;
+varying vec3 vN; varying vec3 vW; varying vec2 vUV;
 void main(){
   float grow = growOf(); vec3 wo = windOff();
   vec3 attach = stemPoint(aL.x, grow, wo);
@@ -326,55 +401,85 @@ void main(){
   vec3 side = cross(up, outw);
   float L = aL.z*mix(.15, 1., grow);
   float u = position.x, v = position.y;
-  float t0 = .5 + .2*aL.w, t1 = 1.05 + .5*aL.w;
+  float t0 = .45 + .25*aL.w, t1 = .95 + .6*aL.w;
   vec2 c = arcC(u, L, t0, t1);
   float th = t0 + t1*u;
   vec2 n2 = vec2(-cos(th), sin(th));
-  float w = .021*pow(max(sin(PI*pow(u, .7)), 0.), .9)*(.8 + .4*aL.w)*mix(.3,1.,grow);
-  float fold = abs(v)*w*.4;
+  float w = .024*pow(max(sin(PI*pow(u, .62)), 0.), .85)*(.8 + .4*aL.w)*mix(.3, 1., grow);
+  float fold = abs(v)*w*.45 - v*v*w*.15;
   vec3 nrm = outw*n2.x + up*n2.y;
-  vec3 p = attach + outw*c.x + up*c.y + side*(v*w) + nrm*fold + wo*u*u*L*.6;
-  vW = p; vN = normalize(nrm - side*sign(v)*.4); vT = .25 + .6*u + .25*(1.-abs(v));
+  float tw = (aL.w - .5)*1.2*u;
+  vec3 sd = side*cos(tw) + nrm*sin(tw);
+  vec3 p = attach + outw*c.x + up*c.y + sd*(v*w) + nrm*fold + wo*u*u*L*.6;
+  vW = p; vN = normalize(nrm - sd*sign(v)*.45); vUV = vec2(u, v);
   gl_Position = projectionMatrix * viewMatrix * vec4(vW, 1.);
 }`,
-  fragmentShader: GL_COMMON + GL_LIGHT + greenFrag,
+  fragmentShader: GL_COMMON + GL_LIGHT + /* glsl */`
+varying vec3 vN; varying vec3 vW; varying vec2 vUV;
+void main(){
+  vec3 N = normalize(vN); vec3 V = normalize(uCamPos - vW);
+  bool front = dot(N, V) > 0.; if(!front) N = -N;
+  float u = vUV.x, v = vUV.y;
+  float mid = exp(-v*v*70.);
+  float veins = pow(1. - abs(fract(v*4.5) - .5)*2., 9.)*.6;
+  vec3 base = mix(vec3(.1,.21,.08), vec3(.24,.42,.15), .35 + .65*u*(1. - abs(v)*.4));
+  base = mix(base, vec3(.42,.58,.28), mid*.55);
+  base *= 1. - veins*.14;
+  base = S(base)*(front ? 1. : .78);
+  N = bumpN(vW, N, -mid*.0006 + veins*.0002);
+  vec3 col = shade(base, N, V, vW, .55, front ? 1.6 : .4);
+  gl_FragColor = vec4(fogIt(col, vW), 1.);
+}`,
 });
 
-// ---- stamens & style
+// ---- stamens, style, bud pedicels
 const tubeMat = new THREE.ShaderMaterial({
   uniforms: U,
   vertexShader: GL_COMMON + GL_FLOWER + /* glsl */`
-attribute vec4 aS; // azimuth, type, seed
+attribute vec4 aS; // azimuth, type (0 filament, 1 style, 2 pedicel), seed | bud height, _ | bud scale
 varying vec3 vN; varying vec3 vW; varying float vT; varying float vType;
 void main(){
+  float s = position.y + .5;
+  float a = atan(position.z, position.x);
+  vType = aS.y; vT = s;
+  if(aS.y > 1.5){
+    float grow = growOf(); vec3 wo = windOff();
+    vec3 sp = stemPoint(aS.z, grow, wo);
+    vec3 hd = budHead(aS, grow, wo);
+    float sc = aS.w*mix(.3, 1., grow);
+    vec3 c = mix(sp, hd, s) + vec3(0., .014*sin(PI*s), 0.)*sc;
+    vec3 T = normalize(hd - sp + vec3(0., .014*PI*cos(PI*s), 0.)*sc + vec3(1e-4));
+    vec3 X = normalize(cross(T, vec3(.3, 0., 1.))); vec3 Z = cross(X, T);
+    vec3 nr = X*cos(a) + Z*sin(a);
+    vW = c + nr*.0055*step(.01, aS.w)*mix(.5, 1., grow); vN = nr;
+    gl_Position = projectionMatrix * viewMatrix * vec4(vW, 1.);
+    return;
+  }
   vec3 head; mat3 B; float grow, bloom, fs;
   flowerFrame(head, B, grow, bloom, fs);
-  float s = position.y + .5;
   float L, t0, t1; stamenParams(aS.y, aS.z, bloom, L, t0, t1);
   vec2 c = arcC(s, L, t0, t1);
   float th = t0 + t1*s;
   vec2 nn = vec2(cos(th), -sin(th));
-  float a = atan(position.z, position.x);
   vec3 dir = vec3(nn*cos(a), sin(a));
-  float r = aS.y < .5 ? .0032*(1. - .4*s) : .0045*(1. + .3*s);
+  float r = aS.y < .5 ? .0028*(1. - .45*s) : .0042*(1. + .25*s);
   vec3 lp = vec3(c, 0.) + dir*r;
   mat3 Ry = rotY(aS.x);
   vW = head + B*(Ry*lp*fs + vec3(0., .01*fs, 0.));
   vN = normalize(B*(Ry*dir));
-  vT = s; vType = aS.y;
   gl_Position = projectionMatrix * viewMatrix * vec4(vW, 1.);
 }`,
   fragmentShader: GL_COMMON + GL_LIGHT + /* glsl */`
 varying vec3 vN; varying vec3 vW; varying float vT; varying float vType;
 void main(){
   vec3 N = normalize(vN); vec3 V = normalize(uCamPos - vW);
-  vec3 base = vType < .5 ? mix(vec3(.62,.8,.5), vec3(.95,.93,.82), vT) : mix(vec3(.6,.78,.45), vec3(.85,.9,.7), vT);
-  vec3 col = shade(S(base), N, V, vW, .7, .5);
+  vec3 base = vType < .5 ? mix(vec3(.55,.74,.42), vec3(.93,.92,.8), vT) : vType < 1.5 ? mix(vec3(.55,.72,.4), vec3(.82,.88,.66), vT) : vec3(.24,.42,.16);
+  vec3 col = shade(S(base), N, V, vW, .7, .9);
   gl_FragColor = vec4(fogIt(col, vW), 1.);
 }`,
 });
 
-// ---- anthers, stigma, receptacle
+// ---- anthers, stigma, ovary
 const blobMat = new THREE.ShaderMaterial({
   uniforms: U,
   vertexShader: GL_COMMON + GL_FLOWER + /* glsl */`
@@ -385,30 +490,34 @@ void main(){
   flowerFrame(head, B, grow, bloom, fs);
   vec3 pos = position; vec3 nrm = normal;
   vec3 center = vec3(0.); vec3 sc = vec3(1.); mat3 O = mat3(1.);
+  float bend = 0.;
   if(aS.y < .5){
     float L, t0, t1; stamenParams(0., aS.z, bloom, L, t0, t1);
     vec2 c = arcC(1., L, t0, t1); float th = t0 + t1;
     vec2 d = vec2(sin(th), cos(th)); vec2 nn = vec2(cos(th), -sin(th));
-    float wob = sin(uTime*1.4 + aS.z*20.)*.3;
+    float wob = sin(uTime*1.4 + aS.z*20.)*.3;                    // versatile anthers rock on their filaments
     vec3 a1 = normalize(vec3(nn*cos(wob), sin(wob)));
     vec3 a2 = vec3(d, 0.);
-    vec3 a3 = normalize(cross(a1, a2));
-    O = mat3(a1, a2, a3);
-    sc = vec3(.03, .0075, .0095)*smoothstep(.05, .5, bloom);
-    center = vec3(c, 0.) + a2*.004;
+    O = mat3(a1, a2, normalize(cross(a1, a2)));
+    sc = vec3(.024, .0042, .0062)*smoothstep(.05, .5, bloom);
+    pos.z *= 1. - .3*exp(-pos.y*pos.y*30.)*step(0., pos.z);        // groove between the pollen sacs
+    center = vec3(c, 0.) + a2*.003;
+    bend = .004*smoothstep(.05, .5, bloom);
   } else if(aS.y < 1.5){
     float L, t0, t1; stamenParams(1., aS.z, bloom, L, t0, t1);
     vec2 c = arcC(1., L, t0, t1);
     float ang = atan(pos.z, pos.x);
-    pos *= 1. + .28*cos(3.*ang)*(1. - abs(pos.y));
-    sc = vec3(.017)*smoothstep(.05, .6, bloom);
-    center = vec3(c, 0.);
+    pos *= 1. + .3*cos(3.*ang)*(1. - abs(pos.y));
+    sc = vec3(.0095, .007, .0095)*smoothstep(.05, .6, bloom);
+    center = vec3(c, 0.) + vec3(sin(t0 + t1), cos(t0 + t1), 0.)*.004;
   } else {
-    sc = vec3(.026, .05, .026)*mix(.6, 1., bloom);
-    center = vec3(0., -.012, 0.);
+    sc = vec3(.017, .04, .017)*mix(.6, 1., bloom);
+    center = vec3(0., -.03, 0.);
+    float ang = atan(pos.z, pos.x);
+    pos.xz *= 1. - .1*pow(abs(cos(3.*ang)), 6.);                  // six-ribbed ovary
   }
   vLocal = pos;
-  vec3 lp = O*(pos*sc) + center;
+  vec3 lp = O*(pos*sc) + center + O[1]*(pos.x*pos.x)*bend;        // anthers curve like little crescents
   vec3 ln = normalize(O*(nrm/max(sc, vec3(1e-4))));
   mat3 Ry = rotY(aS.x);
   vW = head + B*(Ry*lp*fs + vec3(0., .01*fs, 0.));
@@ -422,48 +531,60 @@ void main(){
   vec3 N = normalize(vN); vec3 V = normalize(uCamPos - vW);
   vec3 col;
   if(vType < .5){
-    float n = vnoise(vLocal.xy*14. + vLocal.z*9.);
-    vec3 base = S(mix(vec3(.55,.22,.07), vec3(.86,.45,.14), n));
-    col = shade(base, N, V, vW, .3, .2) + base*.25;
-    col += S(vec3(1.,.6,.25)) * step(.82, hash12(floor(vLocal.xy*40.)+floor(uTime*2.))) * .6;
+    float n = vnoise(vLocal.xy*9. + vLocal.z*7.);
+    float grains = vnoise(vLocal.xy*46. + vLocal.zx*38.);
+    vec3 base = S(mix(vec3(.6,.25,.08), vec3(.93,.52,.18), n*.55 + grains*.45));
+    vec3 Nb = bumpN(vW, N, grains*.00035);
+    col = shade(base, Nb, V, vW, .3, .04) + base*.14;
+    col += S(vec3(1., .65, .32))*step(.9, grains)*.18*max(dot(Nb, uKeyDir), 0.);
   } else if(vType < 1.5){
-    col = shade(S(vec3(.55,.62,.36)), N, V, vW, .5, .9);
+    col = shade(S(vec3(.78,.83,.6)), N, V, vW, .7, 2.2) + S(vec3(.78,.83,.6))*.08;              // wet, glossy stigma
   } else {
-    col = shade(S(vec3(.3,.48,.2)), N, V, vW, .5, .2);
+    col = shade(S(vec3(.32,.5,.22)), N, V, vW, .5, .6);
   }
   gl_FragColor = vec4(fogIt(col, vW), 1.);
 }`,
 });
 
-const P_PETAL = makeInstanced(petalBase, 6, 'aP', (k, i, f) => {
-  const inner = i >= 3 ? 1 : 0;
-  return [f.rot + (i % 3) * (Math.PI * 2 / 3) + inner * Math.PI / 3 + R(-.08, .08), inner, rand(), 0];
+const NB = 2; // side buds per stem
+const P_PETAL = makeInstanced(petalBase, 6, {
+  aP: (i, f) => { const inner = i >= 3 ? 1 : 0; return [f.rot + (i % 3) * (Math.PI * 2 / 3) + inner * Math.PI / 3 + R(-.1, .1), inner, rand(), 0]; },
+  aBud: () => [0, 0, 0, 0],
 }, petalMat);
-const P_STEM = makeInstanced(stemBase, 1, 'aX', () => [0, 0, 0, 0], stemMat);
-const P_LEAF = makeInstanced(leafBase, 7, 'aL', (k, i, f) => [0.1 + i * 0.095 + R(-.02, .02), f.rot * 2 + i * 2.39996 + R(-.3, .3), R(.18, .27) * (1 - i * 0.06), rand()], leafMat);
-const P_TUBE = makeInstanced(tubeBase, 7, 'aS', (k, i, f) => i < 6 ? [f.rot + i * Math.PI / 3 + Math.PI / 6 + R(-.12, .12), 0, rand(), 0] : [f.rot + R(0, 6.28), 1, rand(), 0], tubeMat);
-const P_BLOB = makeInstanced(sphereBase, 8, 'aS', null, blobMat);
-P_BLOB.extraFill = (k, i, f) => {
+const P_BUD = makeInstanced(budBase, 6 * NB, {
+  aP: (i, f) => { const b = f.buds[Math.floor(i / 6)], k = i % 6, inner = k >= 3 ? 1 : 0; return [b.rot + (k % 3) * (Math.PI * 2 / 3) + inner * Math.PI / 3, inner, rand(), 0]; },
+  aBud: (i, f) => { const b = f.buds[Math.floor(i / 6)]; return [1, b.az, b.h, b.s]; },
+}, petalMat);
+const P_STEM = makeInstanced(stemBase, 1, { aX: () => [0, 0, 0, 0] }, stemMat);
+const P_LEAF = makeInstanced(leafBase, 9, { aL: (i, f) => [0.07 + i * 0.082 + R(-.02, .02), f.rot * 2 + i * 2.39996 + R(-.3, .3), R(.2, .3) * (1 - i * 0.055), rand()] }, leafMat);
+const P_TUBE = makeInstanced(tubeBase, 7 + NB, {
+  aS: (i, f) => i < 6 ? [f.rot + i * Math.PI / 3 + Math.PI / 6 + R(-.12, .12), 0, rand(), 0] : i === 6 ? [f.rot + R(0, 6.28), 1, rand(), 0] : (b => [b.az, 2, b.h, b.s])(f.buds[i - 7]),
+}, tubeMat);
+const P_BLOB = makeInstanced(sphereBase, 8, {
   // anthers must follow their filaments exactly: reuse the tube's per-instance data
-  const src = P_TUBE.ex.array, base = (f.slot * 7) * 4;
-  if (i < 6) return [src[base + i * 4], 0, src[base + i * 4 + 2], 0];
-  if (i === 6) return [src[base + 6 * 4], 1, src[base + 6 * 4 + 2], 0];
-  return [0, 2, 0, 0];
-};
-const PARTS = [P_PETAL, P_STEM, P_LEAF, P_TUBE, P_BLOB];
+  aS: (i, f) => {
+    const src = P_TUBE.attrs.aS.array, base = f.slot * (7 + NB) * 4;
+    if (i < 6) return [src[base + i * 4], 0, src[base + i * 4 + 2], 0];
+    if (i === 6) return [src[base + 6 * 4], 1, src[base + 6 * 4 + 2], 0];
+    return [0, 2, 0, 0];
+  },
+}, blobMat);
+const PARTS = [P_PETAL, P_BUD, P_STEM, P_LEAF, P_TUBE, P_BLOB];
 
 function addFlower(o) {
   const slot = flowerCursor % MAXF; flowerCursor++;
   const f = { slot, x: o.x, z: o.z, h: o.h, seed: rand(), plant: o.plant, pal: o.pal, lean: o.lean, leanAmt: o.leanAmt, rot: rand() * 6.28, chimed: !!o.silent };
+  f.buds = Array.from({ length: NB }, (_, j) => ({ az: f.lean + Math.PI + (j ? 1 : -1) * R(.5, 1.2), h: R(.8, .9), s: rand() < (o.budChance ?? .7) ? R(.55, .85) : 0, rot: rand() * 6.28 }));
   flowers[slot] = f;
   for (const P of PARTS) {
+    const A = P.attrs;
     for (let i = 0; i < P.perFlower; i++) {
       const k = (slot * P.perFlower + i) * 4;
-      P.f0.array.set([f.x, f.z, f.h, f.seed], k);
-      P.f1.array.set([f.plant, f.pal, f.lean, f.leanAmt], k);
-      P.ex.array.set(P.extraFill(k, i, f), k);
+      A.aF0.array.set([f.x, f.z, f.h, f.seed], k);
+      A.aF1.array.set([f.plant, f.pal, f.lean, f.leanAmt], k);
+      for (const name in P.extras) A[name].array.set(P.extras[name](i, f), k);
     }
-    P.f0.needsUpdate = P.f1.needsUpdate = P.ex.needsUpdate = true;
+    for (const name in A) A[name].needsUpdate = true;
     P.geo.instanceCount = Math.min(flowerCursor, MAXF) * P.perFlower;
   }
   return f;
@@ -606,8 +727,8 @@ void main(){
   p += uWind*3.*aR.w;
   vec4 mv = viewMatrix*vec4(p, 1.);
   float bl = pow(.5 + .5*sin(uTime*(.7 + aR.w*1.6) + s), 2.5);
-  vA = mix(1., bl, uBlink);
-  gl_PointSize = uSize*(.5 + aR.w)*uPR/max(-mv.z, .1);
+  vA = mix(1., bl, uBlink)*smoothstep(.35, 1.2, -mv.z);
+  gl_PointSize = min(uSize*(.5 + aR.w)*uPR/max(-mv.z, .1), 26.*uPR);
   gl_Position = projectionMatrix*mv;
 }`,
     fragmentShader: `
@@ -673,7 +794,7 @@ void main(){
 
 // ---------------------------------------------------------------- her name, written in pollen
 const nameUniforms = { ...U, uForm: { value: 0 }, uAlpha: { value: 0 }, uBurst: { value: 0 } };
-const nameGroup = new THREE.Group(); scene.add(nameGroup);
+const nameGroup = new THREE.Group(); overlay.add(nameGroup);
 let namePts = null;
 async function buildName() {
   try { await document.fonts.load('200px "Great Vibes"'); } catch (e) { }
@@ -740,11 +861,52 @@ void main(){
   nameGroup.add(namePts);
 }
 
-// ---------------------------------------------------------------- post-processing
-const rt = new THREE.WebGLRenderTarget(innerWidth * renderer.getPixelRatio(), innerHeight * renderer.getPixelRatio(), { type: THREE.HalfFloatType, samples: MOBILE ? 0 : 4 });
-const composer = new EffectComposer(renderer, rt);
-composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.62, 0.55, 0.92);
+// ---------------------------------------------------------------- post-processing: lens depth of field → bloom → grade
+let PR = renderer.getPixelRatio();
+const PR_MAX = PR;
+let sceneRT = null;
+function makeSceneRT(w, h) {
+  if (sceneRT) { sceneRT.depthTexture.dispose(); sceneRT.dispose(); }
+  sceneRT = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, samples: MOBILE ? 0 : 4 });
+  sceneRT.depthTexture = new THREE.DepthTexture(w, h);
+  if (typeof dof !== 'undefined') { dof.uniforms.tColor.value = sceneRT.texture; dof.uniforms.tDepth.value = sceneRT.depthTexture; }
+}
+makeSceneRT(Math.round(innerWidth * PR), Math.round(innerHeight * PR));
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType }));
+var dof = new ShaderPass({
+  uniforms: {
+    tDiffuse: { value: null }, tColor: { value: null }, tDepth: { value: null },
+    uTexel: { value: new THREE.Vector2() }, uNear: { value: camera.near }, uFar: { value: camera.far },
+    uFocus: { value: 4 }, uK: { value: 40 }, uMaxBlur: { value: 12 }, uFarMax: { value: 4 }, uRadStep: { value: 2 },
+  },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }`,
+  fragmentShader: `
+uniform sampler2D tColor; uniform sampler2D tDepth; uniform vec2 uTexel;
+uniform float uNear; uniform float uFar; uniform float uFocus; uniform float uK; uniform float uMaxBlur; uniform float uFarMax; uniform float uRadStep;
+varying vec2 vUv;
+float linD(vec2 uv){ float n = texture2D(tDepth, uv).x*2. - 1.; return 2.*uNear*uFar/(uFar + uNear - n*(uFar - uNear)); }
+float coc(float d){ float c = uK*(1./uFocus - 1./d); return c > 0. ? min(c, uFarMax) : min(-c, uMaxBlur); }
+void main(){
+  float cd = linD(vUv), cs = coc(cd);
+  vec3 col = texture2D(tColor, vUv).rgb; float tot = 1.;
+  float radius = uRadStep, ang = fract(sin(dot(vUv, vec2(12.9898, 78.233)))*43758.5453)*.6;
+  for(int i = 0; i < ${Q.dofSamples}; i++){
+    if(radius >= uMaxBlur) break;
+    vec2 tc = vUv + vec2(cos(ang), sin(ang))*uTexel*radius;
+    vec3 sc = texture2D(tColor, tc).rgb; float sd = linD(tc); float ss = coc(sd);
+    if(sd > cd) ss = clamp(ss, 0., cs*2.);
+    float m = smoothstep(radius - .5, radius + .5, ss);
+    col += mix(col/tot, sc, m); tot += 1.;
+    ang += 2.39996323; radius += uRadStep/radius;
+  }
+  gl_FragColor = vec4(col/tot, 1.);
+}`,
+});
+dof.uniforms.tColor.value = sceneRT.texture; dof.uniforms.tDepth.value = sceneRT.depthTexture;
+composer.addPass(dof);
+const overlayPass = new RenderPass(overlay, camera); overlayPass.clear = false;
+composer.addPass(overlayPass);
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.5, 0.55, 1.0);
 composer.addPass(bloom);
 const finalPass = new ShaderPass({
   uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uFade: { value: 0 }, uRes: { value: new THREE.Vector2(innerWidth, innerHeight) } },
@@ -753,13 +915,15 @@ const finalPass = new ShaderPass({
 uniform sampler2D tDiffuse; uniform float uTime; uniform float uFade; uniform vec2 uRes; varying vec2 vUv;
 void main(){
   vec2 c = vUv - .5; float r2 = dot(c, c);
-  vec2 off = c*r2*.018;
+  vec2 off = c*r2*.014;
   vec3 col = vec3(texture2D(tDiffuse, vUv + off).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv - off).b);
   float vig = smoothstep(.95, .18, length(c*vec2(1., 1.2)));
-  col *= mix(.4, 1., vig);
-  col = mix(col, col*vec3(1.04, .98, 1.06), .5);
+  col *= mix(.42, 1., vig);
+  float l = dot(col, vec3(.2126, .7152, .0722));
+  col = mix(col, col*vec3(.96, .98, 1.08), smoothstep(.2, 0., l)*.6);     // cool shadows
+  col = mix(col, col*vec3(1.05, 1., .96), smoothstep(.3, 1.2, l)*.5);     // warm highlights
   float g = fract(sin(dot(vUv*uRes + fract(uTime)*91.7, vec2(12.9898, 78.233)))*43758.5453);
-  col += (g - .5)*.018*(.3 + col);
+  col += (g - .5)*.016*(.3 + col);
   gl_FragColor = vec4(max(col, 0.)*uFade, 1.);
 }`,
 });
@@ -853,9 +1017,15 @@ document.addEventListener('pointerleave', () => { cursor.style.opacity = 0; });
 
 function resize() {
   const w = innerWidth, h = innerHeight;
-  renderer.setSize(w, h); composer.setSize(w, h);
+  renderer.setPixelRatio(PR); U.uPR.value = PR;
+  renderer.setSize(w, h); composer.setPixelRatio(PR); composer.setSize(w, h);
+  if (sceneRT.width !== Math.round(w * PR) || sceneRT.height !== Math.round(h * PR)) makeSceneRT(Math.round(w * PR), Math.round(h * PR));
   camera.aspect = w / h; camera.fov = w / h < 1 ? 58 : 42; camera.updateProjectionMatrix();
   finalPass.uniforms.uRes.value.set(w, h);
+  const D = dof.uniforms, s = h * PR / 1080;
+  D.uTexel.value.set(1 / (w * PR), 1 / (h * PR));
+  D.uK.value = 30 * s; D.uMaxBlur.value = 9.5 * s; D.uFarMax.value = 3.6 * s;
+  D.uRadStep.value = Math.max(0.8, D.uMaxBlur.value * D.uMaxBlur.value / (2 * Q.dofSamples));
 }
 addEventListener('resize', resize);
 
@@ -951,8 +1121,19 @@ const clock = new THREE.Clock();
 const tmp = new THREE.Vector3();
 resize();
 let fade = 0;
+let perfT = 0, perfN = 0, perfAcc = 0, focusD = 4;
+const camDir = new THREE.Vector3();
 function frame() {
-  const dt = Math.min(clock.getDelta(), 0.05);
+  const rawDt = clock.getDelta(), dt = Math.min(rawDt, 0.05);
+  // keep it smooth: trade resolution for frame rate when the GPU struggles
+  if (!FIXED_RES && started) {
+    perfT += rawDt; perfAcc += rawDt; perfN++;
+    if (perfT > 2.5) {
+      const ms = perfAcc / perfN * 1000; perfT = perfAcc = perfN = 0;
+      if (ms > 26 && PR > 0.65) { PR = Math.max(0.65, PR * 0.8); resize(); }
+      else if (ms < 12 && PR < PR_MAX) { PR = Math.min(PR_MAX, PR * 1.12); resize(); }
+    }
+  }
   U.uTime.value += dt;
   const t = U.uTime.value;
 
@@ -1008,11 +1189,29 @@ function frame() {
   fade = Math.min(1, fade + dt * 0.5);
   finalPass.uniforms.uFade.value = fade;
   finalPass.uniforms.uTime.value = t;
-  composer.render();
+  // autofocus: rack focus onto the open lily nearest the centre of the frame
+  {
+    camera.getWorldDirection(camDir);
+    let best = 1e9, fd = camera.position.distanceTo(target);
+    for (const f of flowers) {
+      if (!f || t - f.plant < 5) continue;
+      tmp.set(Math.cos(f.lean), 0, Math.sin(f.lean)).multiplyScalar(f.leanAmt * f.h * 1.4);
+      tmp.x += f.x; tmp.y = f.h + 0.1; tmp.z += f.z;
+      tmp.sub(camera.position);
+      const d = tmp.length(), ca = tmp.dot(camDir) / d;
+      if (ca < 0.94 || d < 0.6) continue;
+      const score = (1 - ca) * 50 + d * 0.6;
+      if (score < best) { best = score; fd = d; }
+    }
+    focusD += (fd - focusD) * Math.min(1, dt * 2.5);
+    dof.uniforms.uFocus.value = focusD;
+  }
+  renderer.setRenderTarget(sceneRT); renderer.render(scene, camera); renderer.setRenderTarget(null);
+  composer.render(dt);
   requestAnimationFrame(frame);
 }
 buildName().finally(() => { $('#loading').style.opacity = 0; });
 requestAnimationFrame(frame);
 // gentle preview growth behind the intro veil
 addFlower({ x: 0.15, z: -0.2, h: 0.9, plant: -3.5, pal: 0, lean: Math.PI / 2, leanAmt: .14, silent: true });
-window.__lilies = { U, plantAt, start: () => $('#begin').click(), nameUniforms };
+window.__lilies = { U, plantAt, start: () => $('#begin').click(), nameUniforms, cam, dof };
